@@ -1,0 +1,1797 @@
+%%[
+/* ===================================
+   VARIABLE INITIALIZATION
+   =================================== */
+SET @searchInput = RequestParameter("search")
+SET @selectedKey = RequestParameter("selectedKey")
+SET @viewJobId = RequestParameter("viewJobId")
+SET @action = RequestParameter("action")
+
+/* Defaults */
+SET @searchPerformed = "false"
+SET @showDupes = "false"
+SET @showJobModal = "false"
+SET @subStatus = ""
+SET @subKey = ""
+SET @sentCount = 0
+SET @openCount = 0
+SET @clickCount = 0
+SET @bounceCount = 0
+SET @unsubCount = 0
+SET @listCount = 0
+SET @lastSentDate = "—"
+
+/* Search Type Detection */
+SET @isEmailSearch = "false"
+SET @emailInput = ""
+
+/* Audit variables */
+SET @subscriberID = ""
+SET @dateJoined = "—"
+SET @locale = "—"
+SET @bounceType = "—"
+SET @bounceJobID = "—"
+SET @bounceEmailName = "—"
+SET @unsubReason = "—"
+SET @unsubDate = "—"
+SET @emailDomain = "—"
+SET @engagementScore = 0
+
+/* ===================================
+   STEP 1: JOB ANALYTICS LOOKUP (MODAL)
+   =================================== */
+IF NOT EMPTY(@viewJobId) THEN
+    SET @showJobModal = "true"
+    SET @jRows = LookupRows("_Job", "JobID", @viewJobId)
+    IF RowCount(@jRows) > 0 THEN
+        SET @jRow = Row(@jRows, 1)
+        SET @modalJobName = Field(@jRow, "EmailName")
+        SET @modalSubject = Field(@jRow, "EmailSubject")
+        SET @modalFromName = Field(@jRow, "FromName")
+        SET @modalFromEmail = Field(@jRow, "FromEmail")
+        SET @modalSchedTime = Field(@jRow, "SchedTime")
+        SET @modalPickupTime = Field(@jRow, "PickupTime")
+        
+        /* New Details */
+        SET @modalJobStatus = Field(@jRow, "JobStatus")
+        SET @modalCategory = Field(@jRow, "Category")
+        SET @modalSendType = Field(@jRow, "SendType")
+        SET @modalSuppress = Field(@jRow, "SuppressTracking")
+        SET @modalTriggerID = Field(@jRow, "TriggererSendDefinitionObjectID")
+        
+        /* Journey Context Lookup */
+        SET @modalJourneyName = ""
+        SET @modalJourneyVer = ""
+        SET @modalActivityName = ""
+        SET @modalJourneyStatus = ""
+        SET @modalLastPublished = ""
+        
+        IF NOT EMPTY(@modalTriggerID) THEN
+            SET @jaRows = LookupRows("_JourneyActivity", "JourneyActivityObjectID", @modalTriggerID)
+            IF RowCount(@jaRows) > 0 THEN
+                SET @jaRow = Row(@jaRows, 1)
+                SET @jVersionID = Field(@jaRow, "VersionID")
+                SET @modalActivityName = Field(@jaRow, "ActivityName")
+                
+                SET @journeyRows = LookupRows("_Journey", "VersionID", @jVersionID)
+                IF RowCount(@journeyRows) > 0 THEN
+                    SET @jRow = Row(@journeyRows, 1)
+                    SET @modalJourneyName = Field(@jRow, "JourneyName")
+                    SET @modalJourneyVer = Field(@jRow, "VersionNumber")
+                    SET @modalJourneyStatus = Field(@jRow, "JourneyStatus")
+                    SET @modalLastPublished = Field(@jRow, "LastPublishedDate")
+                    
+                    IF NOT EMPTY(@modalLastPublished) THEN
+                        SET @modalLastPublished = Format(@modalLastPublished, "MMM dd, yyyy")
+                    ENDIF
+                ENDIF
+            ENDIF
+        ENDIF
+        
+        IF EMPTY(@modalSchedTime) THEN SET @modalSchedTime = "Triggered/API" ENDIF
+        IF EMPTY(@modalJobStatus) THEN SET @modalJobStatus = "Completed" ENDIF
+        IF EMPTY(@modalSendType) THEN SET @modalSendType = "Normal" ENDIF
+        IF @modalSuppress == "True" THEN 
+            SET @modalTrackStatus = "Disabled" 
+        ELSE 
+            SET @modalTrackStatus = "Active" 
+        ENDIF
+    ELSE
+        SET @modalJobName = "Job Not Found"
+        SET @modalSubject = "N/A"
+    ENDIF
+ENDIF
+
+/* ===================================
+   STEP 2: SUBSCRIBER LOOKUP LOGIC
+   Supports both Email and SubscriberKey
+   =================================== */
+IF NOT EMPTY(@searchInput) THEN
+    SET @searchPerformed = "true"
+    SET @searchInput = TRIM(@searchInput)
+    
+    /* Detect if input is Email or SubscriberKey */
+    SET @atIndex = IndexOf(@searchInput, "@")
+    
+    IF @atIndex > 0 THEN
+        /* Input contains @ - treat as Email */
+        SET @isEmailSearch = "true"
+        SET @emailInput = @searchInput
+        SET @emailDomain = Substring(@searchInput, @atIndex, Length(@searchInput))
+        
+        /* Look up by EmailAddress */
+        SET @subRows = LookupRows("ENT._Subscribers", "EmailAddress", @searchInput)
+        SET @subRowCount = RowCount(@subRows)
+    ELSE
+        /* No @ found - treat as SubscriberKey */
+        SET @isEmailSearch = "false"
+        
+        /* Look up by SubscriberKey */
+        SET @subRows = LookupRows("ENT._Subscribers", "SubscriberKey", @searchInput)
+        SET @subRowCount = RowCount(@subRows)
+        
+        /* If found, get the email for display */
+        IF @subRowCount > 0 THEN
+            SET @tempRow = Row(@subRows, 1)
+            SET @emailInput = Field(@tempRow, "EmailAddress")
+            
+            /* Extract domain from found email */
+            IF NOT EMPTY(@emailInput) THEN
+                SET @atIndex = IndexOf(@emailInput, "@")
+                IF @atIndex > 0 THEN
+                    SET @emailDomain = Substring(@emailInput, @atIndex, Length(@emailInput))
+                ENDIF
+            ENDIF
+        ENDIF
+    ENDIF
+
+    /* === DUPLICATE HANDLING LOGIC === */
+    IF @subRowCount > 1 AND EMPTY(@selectedKey) THEN
+        /* If multiple found and user hasn't chosen one yet, show list */
+        SET @showDupes = "true"
+    ELSEIF @subRowCount > 0 THEN
+        /* Either 1 found, or user selected specific key */
+        
+        /* Select the correct row */
+        IF NOT EMPTY(@selectedKey) THEN
+            FOR @k = 1 TO @subRowCount DO
+                SET @tempRow = Row(@subRows, @k)
+                IF Field(@tempRow, "SubscriberKey") == @selectedKey THEN
+                    SET @firstRow = @tempRow
+                ENDIF
+            NEXT @k
+        ELSE
+            SET @firstRow = Row(@subRows, 1)
+        ENDIF
+
+        /* Proceed with Analytics for the identified row */
+        SET @subKey = Field(@firstRow, "SubscriberKey")
+        SET @subStatus = Field(@firstRow, "Status")
+        SET @subscriberID = Field(@firstRow, "SubscriberID")
+        SET @emailInput = Field(@firstRow, "EmailAddress")
+        SET @dateJoinedRaw = Field(@firstRow, "DateJoined")
+        SET @locale = Field(@firstRow, "Locale")
+
+        /* Re-extract domain in case we got email from row */
+        IF NOT EMPTY(@emailInput) THEN
+            SET @atIndex = IndexOf(@emailInput, "@")
+            IF @atIndex > 0 THEN
+                SET @emailDomain = Substring(@emailInput, @atIndex, Length(@emailInput))
+            ENDIF
+        ENDIF
+
+        IF NOT EMPTY(@dateJoinedRaw) THEN
+            SET @dateJoined = Format(@dateJoinedRaw, "MMM dd, yyyy")
+        ENDIF
+        IF EMPTY(@locale) THEN
+            SET @locale = "Not Set"
+        ENDIF
+
+        /* Engagement metrics - Using bounded queries to prevent timeouts */
+        IF NOT EMPTY(@subKey) THEN
+            /* Use LookupOrderedRows with limits instead of unbounded LookupRows */
+            SET @allSentRows = LookupOrderedRows("_Sent", 500, "EventDate DESC", "SubscriberKey", @subKey)
+            SET @sentCount = RowCount(@allSentRows)
+
+            IF @sentCount > 0 THEN
+                SET @recentSentRow = Row(@allSentRows, 1)
+                SET @mostRecentSentDate = Field(@recentSentRow, "EventDate")
+                IF NOT EMPTY(@mostRecentSentDate) THEN
+                    SET @lastSentDate = Format(@mostRecentSentDate, "MMM dd, yyyy hh:mm tt")
+                ENDIF
+            ENDIF
+
+            SET @openRows = LookupOrderedRows("_Open", 500, "EventDate DESC", "SubscriberKey", @subKey)
+            SET @openCount = RowCount(@openRows)
+
+            SET @clickRows = LookupOrderedRows("_Click", 500, "EventDate DESC", "SubscriberKey", @subKey)
+            SET @clickCount = RowCount(@clickRows)
+
+            SET @bounceRows = LookupOrderedRows("_Bounce", 100, "EventDate DESC", "SubscriberKey", @subKey)
+            SET @bounceCount = RowCount(@bounceRows)
+
+            /* Bounce Details */
+            IF @bounceCount > 0 THEN
+                SET @recentBounceRow = Row(@bounceRows, 1)
+                SET @bounceType = Field(@recentBounceRow, "BounceCategory")
+                SET @bounceDate = Field(@recentBounceRow, "EventDate")
+                SET @bounceJobID = Field(@recentBounceRow, "JobID")
+
+                IF NOT EMPTY(@bounceDate) THEN
+                    SET @bounceDate = Format(@bounceDate, "MMM dd, yyyy hh:mm tt")
+                ENDIF
+                IF EMPTY(@bounceType) THEN SET @bounceType = "Unknown" ENDIF
+
+                SET @bJobRows = LookupRows("_Job", "JobID", @bounceJobID)
+                IF RowCount(@bJobRows) > 0 THEN
+                    SET @bJobRow = Row(@bJobRows, 1)
+                    SET @bounceEmailName = Field(@bJobRow, "EmailName")
+                ELSE
+                    SET @bounceEmailName = "Unknown Email"
+                ENDIF
+            ENDIF
+
+            SET @unsubRows = LookupOrderedRows("_Unsubscribe", 100, "EventDate DESC", "SubscriberKey", @subKey)
+            SET @unsubCount = RowCount(@unsubRows)
+
+            IF @unsubCount > 0 THEN
+                SET @recentUnsubRow = Row(@unsubRows, 1)
+                SET @unsubReason = Field(@recentUnsubRow, "Reason")
+                SET @unsubDateRaw = Field(@recentUnsubRow, "EventDate")
+                IF NOT EMPTY(@unsubDateRaw) THEN
+                    SET @unsubDate = Format(@unsubDateRaw, "MMM dd, yyyy hh:mm tt")
+                ENDIF
+                IF EMPTY(@unsubReason) OR @unsubReason == "unknown" THEN
+                    SET @unsubReason = "User Initiated"
+                ENDIF
+            ENDIF
+
+            SET @listSubRows = LookupOrderedRows("_ListSubscribers", 100, "ListID ASC", "SubscriberKey", @subKey)
+            SET @listCount = RowCount(@listSubRows)
+
+            /* CALCULATE RATES & SCORE */
+            IF @sentCount > 0 THEN
+                SET @openRate = Divide(@openCount, @sentCount) * 100
+                SET @clickRate = Divide(@clickCount, @sentCount) * 100
+                SET @bounceRate = Divide(@bounceCount, @sentCount) * 100
+
+                SET @rawScore = Divide(Add(@openCount, Multiply(@clickCount, 2)), @sentCount) * 10
+                IF @rawScore > 100 THEN
+                    SET @engagementScore = 100
+                ELSE
+                    SET @engagementScore = FormatNumber(@rawScore, "N0")
+                ENDIF
+            ELSE
+                SET @openRate = 0
+                SET @clickRate = 0
+                SET @bounceRate = 0
+                SET @engagementScore = 0
+            ENDIF
+
+            /* === TIMELINE GENERATION === */
+            /* Cache job lookups to prevent repeated queries */
+            SET @recentSentJobs = LookupOrderedRows("_Sent", 10, "EventDate DESC", "SubscriberKey", @subKey)
+            SET @recentSentJobsCount = RowCount(@recentSentJobs)
+            SET @timelineHtml = ""
+
+            IF @recentSentJobsCount > 0 THEN
+                FOR @i = 1 TO @recentSentJobsCount DO
+                    SET @sentRow = Row(@recentSentJobs, @i)
+                    SET @jobId = Field(@sentRow, "JobID")
+                    SET @sentEventDate = Field(@sentRow, "EventDate")
+
+                    SET @tlDate = ""
+                    SET @tlFullDate = ""
+                    IF NOT EMPTY(@sentEventDate) THEN
+                        SET @tlDate = Format(@sentEventDate, "MMM dd")
+                        SET @tlFullDate = Format(@sentEventDate, "MMM dd, yyyy hh:mm tt")
+                    ENDIF
+
+                    SET @jobRow = LookupRows("_Job", "JobID", @jobId)
+                    SET @tlJourneyHtml = "" 
+                    
+                    IF RowCount(@jobRow) > 0 THEN
+                        SET @jobFirstRow = Row(@jobRow, 1)
+                        SET @emailName = Field(@jobFirstRow, "EmailName")
+                        SET @emailSubject = Field(@jobFirstRow, "EmailSubject")
+                        SET @triggerID = Field(@jobFirstRow, "TriggererSendDefinitionObjectID")
+                        
+                        /* Timeline Journey Lookup */
+                        IF NOT EMPTY(@triggerID) THEN
+                            SET @jaRows = LookupRows("_JourneyActivity", "JourneyActivityObjectID", @triggerID)
+                            IF RowCount(@jaRows) > 0 THEN
+                                SET @jaRow = Row(@jaRows, 1)
+                                SET @jVerID = Field(@jaRow, "VersionID")
+                                SET @jRows = LookupRows("_Journey", "VersionID", @jVerID)
+                                IF RowCount(@jRows) > 0 THEN
+                                    SET @jRow = Row(@jRows, 1)
+                                    SET @tlJName = Field(@jRow, "JourneyName")
+                                    SET @tlJVer = Field(@jRow, "VersionNumber")
+                                    SET @tlJourneyHtml = Concat('<div class="journey-pill"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c2.1-2.46 3-5.66 2.38-8a8 8 0 1 0-5.38 5z"></path></svg>', @tlJName, ' (v', @tlJVer, ')</div>')
+                                ENDIF
+                            ENDIF
+                        ENDIF
+                    ELSE
+                        SET @emailName = "Unknown Job"
+                        SET @emailSubject = "Subject Unavailable"
+                    ENDIF
+
+                    SET @emailSubject = Replace(@emailSubject, '"', '&quot;')
+                    SET @emailName = Replace(@emailName, '"', '&quot;')
+
+                    /* Analytics Logic (Open/Click) */
+                    SET @isOpen = "false"
+                    SET @openTime = "—"
+                    SET @timeToOpen = "—"
+                    SET @openCheckRows = LookupOrderedRows("_Open", 1, "EventDate ASC", "SubscriberKey", @subKey, "JobID", @jobId)
+
+                    IF RowCount(@openCheckRows) > 0 THEN
+                        SET @isOpen = "true"
+                        SET @openRow = Row(@openCheckRows, 1)
+                        SET @openEventDate = Field(@openRow, "EventDate")
+                        SET @openTime = Format(@openEventDate, "MMM dd, hh:mm tt")
+                        SET @timeDiff = DateDiff(@sentEventDate, @openEventDate, "MI")
+                        IF @timeDiff < 60 THEN
+                            SET @timeToOpen = Concat(@timeDiff, " mins")
+                        ELSE
+                            SET @timeToOpen = Concat(FormatNumber(Divide(@timeDiff, 60), "N0"), " hours")
+                        ENDIF
+                    ENDIF
+
+                    SET @isClick = "false"
+                    SET @clickTime = "—"
+                    SET @clickCheckRows = LookupOrderedRows("_Click", 1, "EventDate ASC", "SubscriberKey", @subKey, "JobID", @jobId)
+
+                    IF RowCount(@clickCheckRows) > 0 THEN
+                        SET @isClick = "true"
+                        SET @clickRow = Row(@clickCheckRows, 1)
+                        SET @clickEventDate = Field(@clickRow, "EventDate")
+                        SET @clickTime = Format(@clickEventDate, "MMM dd, hh:mm tt")
+                    ENDIF
+
+                    SET @rowClass = "row-sent"
+                    SET @statusIcon = '<div class="tl-icon icon-sent"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg></div>'
+
+                    IF @isClick == "true" THEN
+                        SET @rowClass = "row-click"
+                        SET @statusIcon = '<div class="tl-icon icon-click"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><path d="m12 16-4-4 4-4"/><path d="m16 16-4-4 4-4"/></svg></div>'
+                    ELSEIF @isOpen == "true" THEN
+                        SET @rowClass = "row-open"
+                        SET @statusIcon = '<div class="tl-icon icon-open"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></div>'
+                    ENDIF
+
+                    /* Link Construction - Updated to use 'search' parameter */
+                    SET @jobLink = Concat('?search=', @searchInput, '&selectedKey=', @subKey, '&viewJobId=', @jobId)
+
+                    SET @timelineHtml = Concat(@timelineHtml,
+                        '<details class="tl-item ', @rowClass, '">',
+                            '<summary class="tl-summary">',
+                                '<div class="tl-left">',
+                                    @statusIcon,
+                                    '<div class="tl-main-info">',
+                                        '<div class="tl-subject">', @emailName, '</div>',
+                                        @tlJourneyHtml,
+                                        '<div class="tl-date-pill">', @tlDate, '</div>',
+                                    '</div>',
+                                '</div>',
+                                '<div class="tl-expand-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg></div>',
+                            '</summary>',
+                            '<div class="tl-details">',
+                                '<div class="tl-detail-grid">',
+                                    '<div class="tl-d-item">',
+                                        '<span class="tl-d-label">Job ID (Click for Info)</span>',
+                                        '<a href="', @jobLink, '" class="job-id-link">', @jobId, ' <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>',
+                                    '</div>',
+                                    '<div class="tl-d-item"><span class="tl-d-label">Subject Line</span><span class="tl-d-val">', @emailSubject, '</span></div>',
+                                    '<div class="tl-d-item"><span class="tl-d-label">Sent On</span><span class="tl-d-val">', @tlFullDate, '</span></div>',
+                                    '<div class="tl-d-item"><span class="tl-d-label">Time to Open</span><span class="tl-d-val">', @timeToOpen, '</span></div>',
+                                    '<div class="tl-d-item"><span class="tl-d-label">Open Time</span><span class="tl-d-val">', @openTime, '</span></div>',
+                                    '<div class="tl-d-item"><span class="tl-d-label">Click Time</span><span class="tl-d-val">', @clickTime, '</span></div>',
+                                '</div>',
+                            '</div>',
+                        '</details>'
+                    )
+                NEXT @i
+            ENDIF
+        ENDIF
+    ELSE
+        SET @subStatus = "Not Found"
+    ENDIF
+ENDIF
+]%%
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SFMC 180 — Subscriber Diagnostics</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Roboto+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+    /* === PALETTE === */
+    --gm-bg: #F8F9FA;
+    --gm-surface: #FFFFFF;
+    --google-blue: #1A73E8;
+    --google-green: #1E8E3E;
+    --google-red: #D93025;
+    --google-yellow: #F9AB00;
+
+    /* Gradients */
+    --grad-blue: linear-gradient(135deg, #E8F0FE 0%, #D2E3FC 100%);
+    --grad-green: linear-gradient(135deg, #E6F4EA 0%, #CEEAD6 100%);
+    --grad-purple: linear-gradient(135deg, #F3E8FD 0%, #E1BEE7 100%);
+    --grad-red: linear-gradient(135deg, #FCE8E6 0%, #FAD2CF 100%);
+
+    /* Pastel Metric Colors */
+    --pas-blue: #D3E3FD;
+    --pas-green: #C4EED0;
+    --pas-purp: #E9D2FD;
+    --pas-red: #FAD2CF;
+    --pas-org: #FDE293;
+
+    --gm-text: #202124;
+    --gm-subtext: #5F6368;
+    --gm-border: #DADCE0;
+    --shadow-1: 0 1px 2px 0 rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);
+    --shadow-2: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    --rad-md: 16px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Outfit', 'Google Sans', Roboto, sans-serif;
+}
+
+body {
+    background-color: var(--gm-bg);
+    color: var(--gm-text);
+    min-height: 100vh;
+    padding: 40px 20px;
+    display: flex;
+    justify-content: center;
+}
+
+.app-container {
+    width: 100%;
+    max-width: 1200px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    animation: fadeIn 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* === ORIGINAL PRISM LOGO WITH ENHANCED 180 === */
+.logo-prism {
+    width: 48px;
+    height: 48px;
+    border-radius: 14px;
+    background: conic-gradient(from 180deg at 50% 50%, #1A73E8 0deg, #EA4335 90deg, #FBBC04 180deg, #34A853 270deg, #1A73E8 360deg);
+    position: relative;
+    box-shadow: 0 4px 12px rgba(26, 115, 232, 0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.logo-prism::after {
+    content: '';
+    position: absolute;
+    inset: 3px;
+    background: #FFFFFF;
+    border-radius: 11px;
+    z-index: 1;
+}
+
+.logo-prism .logo-text {
+    position: relative;
+    z-index: 2;
+    font-weight: 900;
+    font-size: 16px;
+    background: linear-gradient(135deg, #1A73E8 0%, #EA4335 50%, #FBBC04 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -1px;
+    filter: drop-shadow(0 1px 1px rgba(0,0,0,0.1));
+}
+
+/* Large logo variant for landing page */
+.logo-prism.logo-lg {
+    width: 80px;
+    height: 80px;
+    border-radius: 22px;
+    box-shadow: 0 6px 20px rgba(26, 115, 232, 0.4);
+}
+
+.logo-prism.logo-lg::after {
+    inset: 5px;
+    border-radius: 17px;
+}
+
+.logo-prism.logo-lg .logo-text {
+    font-size: 28px;
+    letter-spacing: -2px;
+    font-weight: 900;
+}
+
+/* NAV */
+.top-nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.brand-wrap {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.brand-name {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--gm-text);
+    letter-spacing: -0.5px;
+}
+
+.brand-name span {
+    color: var(--gm-subtext);
+    font-weight: 500;
+}
+
+/* SEARCH - Updated placeholder */
+.search-pill form {
+    display: flex;
+    align-items: stretch;
+    background: var(--gm-surface);
+    border: 1px solid var(--gm-border);
+    border-radius: 12px;
+    box-shadow: var(--shadow-1);
+    transition: all 0.2s;
+    overflow: hidden;
+    height: 48px;
+}
+
+.search-pill form:focus-within {
+    box-shadow: var(--shadow-2);
+    border-color: var(--google-blue);
+    transform: translateY(-1px);
+}
+
+.search-pill input {
+    flex: 1;
+    border: none;
+    background: transparent;
+    padding: 0 16px;
+    font-size: 15px;
+    height: 100%;
+    outline: none;
+    color: var(--gm-text);
+    min-width: 0;
+}
+
+.search-pill input::placeholder {
+    color: var(--gm-subtext);
+}
+
+.search-btn {
+    background: var(--google-blue);
+    color: white;
+    border: none;
+    padding: 0 24px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.search-btn:hover {
+    background: #1557B0;
+}
+
+.search-btn:active {
+    background: #1248a0;
+}
+
+/* Search Type Indicator */
+.search-type-hint {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--gm-subtext);
+    margin-top: 8px;
+    padding-left: 4px;
+}
+
+.search-type-hint svg {
+    opacity: 0.6;
+}
+
+/* Back Button Style */
+.back-nav-btn {
+    background: #FFFFFF;
+    color: var(--gm-text);
+    border: 1px solid var(--gm-border);
+    padding: 0 20px;
+    height: 48px;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    box-shadow: var(--shadow-1);
+    text-decoration: none;
+}
+.back-nav-btn:hover {
+    background: #F8F9FA;
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-2);
+    color: var(--google-blue);
+    border-color: var(--google-blue);
+}
+
+/* PROFILE */
+.profile-card {
+    background: var(--gm-surface);
+    border-radius: var(--rad-md);
+    box-shadow: var(--shadow-1);
+    overflow: hidden;
+}
+
+.status-bar {
+    width: 100%;
+    padding: 8px 24px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.sb-active { background: #E6F4EA; color: #137333; }
+.sb-held { background: #FEF7E0; color: #B06000; }
+.sb-bounced { background: #FCE8E6; color: #C5221F; }
+.sb-unsub { background: #F1F3F4; color: #5F6368; }
+
+.profile-main {
+    padding: 32px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    position: relative;
+}
+
+/* === GLOSSY ICONS CSS === */
+.avatar-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 80px;
+    height: 80px;
+}
+
+.fun-icon {
+    width: 80px;
+    height: 80px;
+    filter: drop-shadow(0 6px 12px rgba(0,0,0,0.15));
+    transition: transform 0.3s;
+}
+
+.fun-icon:hover {
+    transform: scale(1.05);
+}
+
+.profile-info h1 {
+    font-size: 26px;
+    font-weight: 500;
+    margin: 0;
+    color: var(--gm-text);
+}
+
+.profile-info .meta {
+    display: flex;
+    gap: 24px;
+    margin-top: 8px;
+    font-size: 14px;
+    color: var(--gm-subtext);
+}
+
+.meta-item {
+    display: flex;
+    gap: 6px;
+}
+
+.meta-label {
+    font-weight: 600;
+}
+
+/* === METRICS === */
+.metrics-row {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 16px;
+}
+
+.metric-card {
+    padding: 20px;
+    border-radius: 20px;
+    text-align: center;
+    transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+    position: relative;
+    overflow: hidden;
+    color: #3C4043;
+    border: 1px solid rgba(0,0,0,0.05);
+}
+
+.metric-card:hover {
+    transform: translateY(-6px) rotate(-2deg);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+    z-index: 2;
+}
+
+.mc-sent { background: var(--pas-blue); }
+.mc-open { background: var(--pas-green); }
+.mc-click { background: var(--pas-purp); }
+.mc-bounce { background: var(--pas-red); }
+.mc-score { background: linear-gradient(135deg, #FFF7E0, #FCE4EC, #E3F2FD); }
+.mc-list { background: var(--pas-org); }
+
+.mc-bg-icon {
+    position: absolute;
+    bottom: -10px;
+    right: -10px;
+    width: 60px;
+    height: 60px;
+    opacity: 0.15;
+    transform: rotate(-15deg);
+    pointer-events: none;
+}
+
+.m-val {
+    font-size: 28px;
+    font-weight: 800;
+    position: relative;
+    z-index: 1;
+}
+
+.m-lbl {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-top: 4px;
+    position: relative;
+    z-index: 1;
+    letter-spacing: 0.5px;
+}
+
+.m-sub {
+    font-size: 11px;
+    font-weight: 700;
+    margin-top: 8px;
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.6);
+    position: relative;
+    z-index: 1;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+}
+
+.split-grid {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 24px;
+    align-items: start;
+}
+
+/* === PRETTY BOUNCE BOX === */
+.bounce-alert {
+    background: linear-gradient(135deg, #FFF5F5 0%, #FFECEC 100%);
+    border-left: 4px solid #F28B82;
+    border-radius: 12px;
+    padding: 16px;
+    margin-top: 16px;
+    box-shadow: 0 2px 8px rgba(242, 139, 130, 0.15);
+}
+
+.ba-header {
+    font-size: 13px;
+    font-weight: 700;
+    color: #C5221F;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ba-detail {
+    font-size: 14px;
+    color: #B3261E;
+    margin-bottom: 12px;
+    font-weight: 500;
+}
+
+.ba-grid {
+    display: grid;
+    gap: 8px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(197, 34, 31, 0.15);
+}
+
+.ba-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ba-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: #EA4335;
+    letter-spacing: 0.5px;
+}
+
+.ba-val {
+    font-size: 13px;
+    font-weight: 600;
+    color: #3C4043;
+}
+
+.ba-pill {
+    background: #FCE8E6;
+    color: #C5221F;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: 'Roboto Mono', monospace;
+    font-size: 12px;
+    width: fit-content;
+}
+
+/* TIMELINE */
+.timeline-card {
+    background: var(--gm-surface);
+    border-radius: var(--rad-md);
+    box-shadow: var(--shadow-1);
+    padding: 0;
+    overflow: hidden;
+}
+
+.tl-header-row {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--gm-border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #fff;
+}
+
+.tl-title {
+    font-size: 18px;
+    font-weight: 700;
+    background: linear-gradient(90deg, #1A73E8, #9334E6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.tl-item {
+    border-bottom: 1px solid #F1F3F4;
+    transition: all 0.2s;
+    border-left: 4px solid transparent;
+}
+
+.tl-item:last-child {
+    border-bottom: none;
+}
+
+.row-sent { border-left-color: var(--google-blue); }
+.row-open { border-left-color: var(--google-green); }
+.row-click { border-left-color: #9334E6; }
+
+.tl-item:hover { background: #fafafa; }
+.row-sent:hover { background: #F8FAFF; }
+.row-open:hover { background: #F6FDF8; }
+.row-click:hover { background: #FCF8FF; }
+
+.tl-summary {
+    list-style: none;
+    padding: 16px 20px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.tl-summary::-webkit-details-marker {
+    display: none;
+}
+
+.tl-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.tl-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: transform 0.3s;
+}
+
+.icon-sent { background: var(--grad-blue); color: var(--google-blue); }
+.icon-open { background: var(--grad-green); color: var(--google-green); }
+.icon-click { background: var(--grad-purple); color: #9334E6; }
+
+.tl-item:hover .tl-icon {
+    transform: scale(1.1) rotate(5deg);
+}
+
+.tl-main-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tl-subject {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--gm-text);
+}
+
+.tl-date-pill {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--gm-subtext);
+    background: #F1F3F4;
+    padding: 2px 8px;
+    border-radius: 4px;
+    width: fit-content;
+}
+
+.tl-expand-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #F1F3F4;
+    color: var(--gm-subtext);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.3s;
+}
+
+.tl-item[open] .tl-expand-icon {
+    transform: rotate(180deg);
+    background: var(--google-blue);
+    color: white;
+}
+
+.tl-details {
+    padding: 0 24px 24px 80px;
+    animation: popIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.tl-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    background: #fff;
+    padding: 16px;
+    border: 1px solid var(--gm-border);
+    border-radius: 12px;
+    box-shadow: var(--shadow-1);
+}
+
+.tl-d-item {
+    display: flex;
+    flex-direction: column;
+    font-size: 13px;
+}
+
+.tl-d-label {
+    color: var(--gm-subtext);
+    font-size: 10px;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.tl-d-val {
+    color: var(--gm-text);
+    font-weight: 500;
+    overflow-wrap: break-word;
+}
+
+.val-pill {
+    background: #F1F3F4;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: monospace;
+}
+
+.job-id-link {
+    color: var(--google-blue);
+    text-decoration: none;
+    font-family: 'Roboto Mono', monospace;
+    font-weight: 600;
+    background: #e8f0fe;
+    padding: 2px 8px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    transition: all 0.2s;
+}
+.job-id-link:hover {
+    background: #d2e3fc;
+    transform: translateY(-1px);
+}
+
+.journey-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #F3E8FD;
+    color: #9334E6;
+    border: 1px solid #E9D2FD;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-top: 4px;
+    width: fit-content;
+}
+
+/* === DUPLICATE LIST DESIGN === */
+.dupe-container {
+    max-width: 800px;
+    margin: 0 auto;
+    width: 100%;
+}
+
+.dupe-header-card {
+    background: linear-gradient(135deg, #FEF7E0 0%, #FFF8E1 100%);
+    border: 1px solid #F9AB00;
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    box-shadow: var(--shadow-1);
+}
+
+.dupe-icon-circle {
+    width: 48px;
+    height: 48px;
+    background: #FFF;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #F9AB00;
+    box-shadow: 0 2px 5px rgba(249, 171, 0, 0.2);
+}
+
+.dupe-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 12px;
+}
+
+.dupe-card-row {
+    background: #FFFFFF;
+    border: 1px solid var(--gm-border);
+    border-radius: 16px;
+    padding: 20px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    text-decoration: none;
+    color: inherit;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+    overflow: hidden;
+}
+
+.dupe-card-row:hover {
+    transform: translateY(-3px) scale(1.01);
+    box-shadow: 0 6px 12px rgba(60,64,67,0.1);
+    border-color: var(--google-blue);
+}
+
+.dupe-card-row:hover .dupe-arrow-btn {
+    background: var(--google-blue);
+    color: #FFF;
+}
+
+.dc-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.dc-avatar {
+    width: 44px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0; 
+}
+.dc-avatar svg {
+    width: 100%;
+    height: 100%;
+    filter: drop-shadow(0 4px 6px rgba(0,0,0,0.15));
+    transition: transform 0.2s;
+}
+.dupe-card-row:hover .dc-avatar svg {
+    transform: scale(1.1) rotate(5deg);
+}
+
+.dc-info {
+    display: flex;
+    flex-direction: column;
+}
+
+.dc-key {
+    font-family: 'Roboto Mono', monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--gm-text);
+}
+
+.dc-date {
+    font-size: 12px;
+    color: var(--gm-subtext);
+    margin-top: 2px;
+}
+
+.dc-right {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+}
+
+.dc-status-pill {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.st-active { background: #E6F4EA; color: #1E8E3E; }
+.st-held { background: #FEF7E0; color: #B06000; }
+.st-bounced { background: #FCE8E6; color: #D93025; }
+.st-unsub { background: #F1F3F4; color: #5F6368; }
+
+.dupe-arrow-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #F8F9FA;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--gm-subtext);
+    transition: all 0.2s;
+}
+
+/* === MODAL STYLES === */
+.modal-overlay {
+    position: fixed;
+    top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.4);
+    backdrop-filter: blur(8px);
+    z-index: 999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.3s;
+}
+
+.modal-card {
+    background: #FFF;
+    border-radius: 24px;
+    width: 90%;
+    max-width: 600px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    overflow: hidden;
+    animation: popIn 0.3s;
+}
+
+.modal-header {
+    background: linear-gradient(135deg, #E8F0FE 0%, #D2E3FC 100%);
+    padding: 24px;
+    border-bottom: 1px solid #D2E3FC;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+}
+
+.modal-title-group {
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: #1967D2;
+    margin-bottom: 4px;
+}
+.modal-sub {
+    font-size: 13px;
+    color: #185ABC;
+    font-family: 'Roboto Mono', monospace;
+    background: rgba(255,255,255,0.5);
+    padding: 2px 8px;
+    border-radius: 4px;
+    width: fit-content;
+}
+
+.modal-body {
+    padding: 24px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+/* Job Cards inside Modal */
+.job-card {
+    padding: 16px;
+    border-radius: 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    text-align: left;
+    position: relative;
+    overflow: hidden;
+    min-height: 90px;
+}
+
+.jc-full { grid-column: span 2; }
+
+.jc-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-bottom: 6px;
+    letter-spacing: 0.5px;
+}
+
+.jc-val {
+    font-size: 16px;
+    font-weight: 700;
+    color: #3C4043;
+    word-break: break-word;
+}
+
+.jc-icon {
+    position: absolute;
+    bottom: -5px;
+    right: -5px;
+    width: 40px;
+    height: 40px;
+    opacity: 0.1;
+    transform: rotate(-10deg);
+}
+
+.jc-blue { background: #EEF5FF; color: #174EA6; border:1px solid #D3E3FD; }
+.jc-green { background: #F0FDF4; color: #0D652D; border:1px solid #C4EED0; }
+.jc-purp { background: #FBF5FF; color: #681DA8; border:1px solid #E9D2FD; }
+.jc-org { background: #FFFBF0; color: #B06000; border:1px solid #FDE293; }
+.jc-red { background: #FFF5F4; color: #B3261E; border:1px solid #FAD2CF; }
+
+/* New Journey Classes */
+.jc-journey {
+    background: linear-gradient(135deg, #FBF7FF 0%, #F3E8FD 100%);
+    color: #5B2C6F;
+    border: 1px solid #D8B4FE;
+}
+
+.journey-table {
+    width: 100%;
+    font-size: 13px;
+    border-collapse: collapse;
+    margin-top: 8px;
+}
+.journey-table td {
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(91, 44, 111, 0.08);
+}
+.journey-table tr:last-child td {
+    border-bottom: none;
+}
+.jt-label { opacity: 0.7; }
+.jt-val { font-weight: 600; text-align: right; }
+
+.modal-footer {
+    padding: 16px 24px;
+    background: #F8F9FA;
+    border-top: 1px solid var(--gm-border);
+    text-align: right;
+}
+
+.modal-close-btn {
+    background: #FFF;
+    border: 1px solid var(--gm-border);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    color: var(--gm-text);
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 14px;
+    transition: all 0.2s;
+}
+.modal-close-btn:hover { background: #F1F3F4; }
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes popIn {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+@media (max-width: 900px) {
+    .metrics-row { grid-template-columns: 1fr 1fr; }
+    .split-grid { grid-template-columns: 1fr; }
+    .tl-details { padding: 0 24px 24px 24px; }
+}
+</style>
+</head>
+<body>
+
+<!-- SVG DEFS FOR GLOSSY 3D GRADIENTS -->
+<svg style="position: absolute; width: 0; height: 0; overflow: hidden;">
+<defs>
+    <!-- Active: 3D Emerald Sphere -->
+    <radialGradient id="grad-smile" cx="30%" cy="30%" r="70%">
+        <stop offset="0%" style="stop-color:#81e6d9; stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#34A853; stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#1E8E3E; stop-opacity:1" />
+    </radialGradient>
+    
+    <!-- Bounced: 3D Crimson Sphere -->
+    <radialGradient id="grad-sad" cx="30%" cy="30%" r="70%">
+        <stop offset="0%" style="stop-color:#ff8a80; stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#EA4335; stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#C5221F; stop-opacity:1" />
+    </radialGradient>
+
+    <!-- Neutral: 3D Silver Sphere -->
+    <radialGradient id="grad-meh" cx="30%" cy="30%" r="70%">
+        <stop offset="0%" style="stop-color:#e8eaed; stop-opacity:1" />
+        <stop offset="50%" style="stop-color:#9AA0A6; stop-opacity:1" />
+        <stop offset="100%" style="stop-color:#5F6368; stop-opacity:1" />
+    </radialGradient>
+</defs>
+</svg>
+
+%%[ IF @searchPerformed == "false" THEN ]%%
+    <div class="app-container" style="align-items: center; justify-content: center; min-height: 80vh;">
+        <div class="profile-card" style="padding: 60px; text-align: center; max-width: 550px; width: 100%;">
+            
+            <!-- ENHANCED PRISM LOGO -->
+            <div style="display: flex; justify-content: center; margin-bottom: 24px;">
+                <div class="logo-prism logo-lg">
+                    <span class="logo-text">180</span>
+                </div>
+            </div>
+            
+            <h1 style="font-size: 32px; font-weight: 700; margin-bottom: 32px;">SFMC 180</h1>
+            
+            <div class="search-pill" style="width: 100%;">
+                <form method="post">
+                    <input type="text" name="search" placeholder="Enter email or subscriber key..." required>
+                    <button type="submit" class="search-btn">Search</button>
+                </form>
+            </div>
+            
+            <div class="search-type-hint">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <path d="M12 16v-4"></path>
+                    <path d="M12 8h.01"></path>
+                </svg>
+                <span>Supports email address (user@domain.com) or subscriber key lookup</span>
+            </div>
+        </div>
+    </div>
+%%[ ELSE ]%%
+
+    <div class="app-container">
+        <!-- HEADER -->
+        <div class="top-nav">
+            <div class="brand-wrap">
+                <!-- ENHANCED PRISM LOGO -->
+                <div class="logo-prism">
+                    <span class="logo-text">180</span>
+                </div>
+                <div class="brand-name">SFMC 180</div>
+            </div>
+            
+            %%[ IF NOT EMPTY(@selectedKey) THEN ]%%
+                <!-- DRILL DOWN MODE: Show Back Button instead of Search -->
+                <a href="?search=%%=v(@searchInput)=%%" class="back-nav-btn">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+                    Back to List
+                </a>
+            %%[ ELSE ]%%
+                <!-- SEARCH MODE -->
+                <div class="search-pill" style="width: 380px;">
+                    <form method="post">
+                        <input type="text" name="search" placeholder="Email or subscriber key..." value="%%=v(@searchInput)=%%">
+                        <button type="submit" class="search-btn">Search</button>
+                    </form>
+                </div>
+            %%[ ENDIF ]%%
+        </div>
+
+        %%[ IF @subStatus == "Not Found" THEN ]%%
+            <div class="profile-card" style="padding: 80px; text-align: center;">
+                <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#DADCE0" stroke-width="1.5" style="margin-bottom: 16px;">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <path d="M21 21l-4.35-4.35"></path>
+                    <path d="M8 8l6 6M14 8l-6 6" stroke="#D93025" stroke-width="2"></path>
+                </svg>
+                <h2>No Subscriber Found</h2>
+                <p style="color: var(--gm-subtext); margin-top:8px;">
+                    We searched for <strong style="font-family: 'Roboto Mono', monospace; background: #F1F3F4; padding: 2px 8px; border-radius: 4px;">%%=v(@searchInput)=%%</strong> 
+                    %%[ IF @isEmailSearch == "true" THEN ]%%
+                        as an <em>email address</em>
+                    %%[ ELSE ]%%
+                        as a <em>subscriber key</em>
+                    %%[ ENDIF ]%%
+                    but found no records.
+                </p>
+                <p style="color: var(--gm-subtext); margin-top: 16px; font-size: 13px;">
+                    %%[ IF @isEmailSearch == "true" THEN ]%%
+                        Try searching by subscriber key instead, or verify the email is correct.
+                    %%[ ELSE ]%%
+                        Try searching by email address instead, or verify the subscriber key is correct.
+                    %%[ ENDIF ]%%
+                </p>
+            </div>
+        %%[ ELSEIF @showDupes == "true" THEN ]%%
+            
+            <div class="dupe-container">
+                <!-- Header Alert Card -->
+                <div class="dupe-header-card">
+                    <div class="dupe-icon-circle">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="8.5" cy="7" r="4"></circle>
+                            <line x1="20" y1="8" x2="20" y2="14"></line>
+                            <line x1="23" y1="11" x2="17" y2="11"></line>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 style="font-size: 18px; font-weight: 700; color: #B06000; margin-bottom:4px;">Multiple Records Found</h2>
+                        <p style="font-size: 14px; color: #8C4B00;">
+                            Found <strong>%%=v(@subRowCount)=%%</strong> subscribers matching 
+                            <em style="font-family: 'Roboto Mono', monospace;">%%=v(@searchInput)=%%</em>. 
+                            Select the specific record to audit.
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Interactive Grid -->
+                <div class="dupe-grid">
+                    %%[ 
+                    FOR @d = 1 TO @subRowCount DO 
+                        SET @dRow = Row(@subRows, @d)
+                        SET @dKey = Field(@dRow, "SubscriberKey")
+                        SET @dEmail = Field(@dRow, "EmailAddress")
+                        SET @dStatus = Field(@dRow, "Status")
+                        SET @dDate = Field(@dRow, "DateJoined")
+                        
+                        IF NOT EMPTY(@dDate) THEN SET @dDateStr = Format(@dDate, "MMM dd, yyyy") ELSE SET @dDateStr = "Unknown Date" ENDIF
+                        
+                        SET @pillClass = "st-unsub"
+                        IF @dStatus == "active" THEN SET @pillClass = "st-active"
+                        ELSEIF @dStatus == "held" THEN SET @pillClass = "st-held"
+                        ELSEIF @dStatus == "bounced" THEN SET @pillClass = "st-bounced"
+                        ENDIF
+                    ]%%
+                    
+                    <a href="?search=%%=v(@searchInput)=%%&selectedKey=%%=v(@dKey)=%%" class="dupe-card-row">
+                        <div class="dc-left">
+                            <div class="dc-avatar">
+                                %%[ IF @dStatus == 'active' THEN ]%%
+                                    <!-- Happy Green Sphere -->
+                                    <svg viewBox="0 0 24 24" fill="url(#grad-smile)">
+                                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"/>
+                                    </svg>
+                                %%[ ELSEIF @dStatus == 'bounced' THEN ]%%
+                                    <!-- Sad Red Sphere -->
+                                    <svg viewBox="0 0 24 24" fill="url(#grad-sad)">
+                                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 3.5c-2.33 0-4.31 1.46-5.11 3.5h10.22c-.8-2.04-2.78-3.5-5.11-3.5z"/>
+                                    </svg>
+                                %%[ ELSE ]%%
+                                    <!-- Neutral Silver Sphere -->
+                                    <svg viewBox="0 0 24 24" fill="url(#grad-meh)">
+                                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-2.5-5H15c.28 0 .5-.22.5-.5s-.22-.5-.5-.5h-5.5c-.28 0-.5.22-.5.5s.22.5.5.5zm6-4.5c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11z"/>
+                                    </svg>
+                                %%[ ENDIF ]%%
+                            </div>
+                            <div class="dc-info">
+                                <div class="dc-key">%%=v(@dKey)=%%</div>
+                                <div class="dc-date">%%=v(@dEmail)=%% • Joined: %%=v(@dDateStr)=%%</div>
+                            </div>
+                        </div>
+                        <div class="dc-right">
+                            <span class="dc-status-pill %%=v(@pillClass)=%%">%%=v(@dStatus)=%%</span>
+                            <div class="dupe-arrow-btn">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                            </div>
+                        </div>
+                    </a>
+                    
+                    %%[ NEXT @d ]%%
+                </div>
+            </div>
+
+        %%[ ELSE ]%%
+
+            <!-- PROFILE CARD -->
+            <div class="profile-card">
+                <div class="status-bar %%[ IF @subStatus == 'active' THEN ]%%sb-active%%[ ELSEIF @subStatus == 'held' THEN ]%%sb-held%%[ ELSEIF @subStatus == 'bounced' THEN ]%%sb-bounced%%[ ELSE ]%%sb-unsub%%[ ENDIF ]%%">
+                    <span>Status: %%=v(@subStatus)=%%</span>
+                    <span>
+                        %%=v(@subKey)=%%
+                    </span>
+                </div>
+                <div class="profile-main">
+
+                    <!-- GLOSSY ICON -->
+                    <div class="avatar-wrap">
+                        %%[ IF @subStatus == 'active' THEN ]%%
+                        <svg class="fun-icon" viewBox="0 0 24 24" fill="url(#grad-smile)">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"/>
+                        </svg>
+                        %%[ ELSEIF @subStatus == 'bounced' THEN ]%%
+                        <svg class="fun-icon" viewBox="0 0 24 24" fill="url(#grad-sad)">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 3.5c-2.33 0-4.31 1.46-5.11 3.5h10.22c-.8-2.04-2.78-3.5-5.11-3.5z"/>
+                        </svg>
+                        %%[ ELSE ]%%
+                        <svg class="fun-icon" viewBox="0 0 24 24" fill="url(#grad-meh)">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-2.5-5H15c.28 0 .5-.22.5-.5s-.22-.5-.5-.5h-5.5c-.28 0-.5.22-.5.5s.22.5.5.5zm6-4.5c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11z"/>
+                        </svg>
+                        %%[ ENDIF ]%%
+                    </div>
+
+                    <div class="profile-info">
+                        <h1>%%=v(@emailInput)=%%</h1>
+                        <div class="meta">
+                            <div class="meta-item"><span class="meta-label">Domain:</span> %%=v(@emailDomain)=%%</div>
+                            <div class="meta-item"><span class="meta-label">Joined:</span> %%=v(@dateJoined)=%%</div>
+                            <div class="meta-item"><span class="meta-label">Locale:</span> %%=v(@locale)=%%</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- METRICS -->
+            <div class="metrics-row">
+                <div class="metric-card mc-sent">
+                    <svg class="mc-bg-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M2 22L22 2 11 13 2 22z"/></svg>
+                    <div class="m-val">%%=v(@sentCount)=%%</div>
+                    <div class="m-lbl">Sent</div>
+                </div>
+                <div class="metric-card mc-open">
+                    <svg class="mc-bg-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0z"/></svg>
+                    <div class="m-val">%%=v(@openCount)=%%</div>
+                    <div class="m-lbl">Opens</div>
+                    <div class="m-sub">%%=FormatNumber(@openRate, "N1")=%%</div>
+                </div>
+                <div class="metric-card mc-click">
+                    <svg class="mc-bg-icon" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="8"/></svg>
+                    <div class="m-val">%%=v(@clickCount)=%%</div>
+                    <div class="m-lbl">Clicks</div>
+                    <div class="m-sub">%%=FormatNumber(@clickRate, "N1")=%%</div>
+                </div>
+                <div class="metric-card mc-bounce">
+                    <svg class="mc-bg-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 22h20L12 2z"/></svg>
+                    <div class="m-val">%%=v(@bounceCount)=%%</div>
+                    <div class="m-lbl">Bounces</div>
+                    <div class="m-sub">%%=FormatNumber(@bounceRate, "N1")=%%</div>
+                </div>
+                <div class="metric-card mc-score">
+                    <svg class="mc-bg-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+                    <div class="m-val">%%=v(@engagementScore)=%%</div>
+                    <div class="m-lbl">Eng. Score</div>
+                </div>
+                <div class="metric-card mc-list">
+                    <svg class="mc-bg-icon" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+                    <div class="m-val">%%=v(@listCount)=%%</div>
+                    <div class="m-lbl">Lists</div>
+                </div>
+            </div>
+
+            <!-- BOTTOM GRID -->
+            <div class="split-grid">
+                <!-- LEFT INFO -->
+                <div class="profile-card" style="padding: 24px;">
+                    <h3 style="font-size: 16px; font-weight: 700; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--gm-subtext);">Detailed Info</h3>
+                    <div style="display:flex; flex-direction:column; gap:16px;">
+                        <div style="display:flex; justify-content:space-between; font-size:14px;">
+                            <span style="color:var(--gm-subtext);">Subscriber ID</span>
+                            <strong>%%=v(@subscriberID)=%%</strong>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; font-size:14px;">
+                            <span style="color:var(--gm-subtext);">Last Sent</span>
+                            <strong>%%=v(@lastSentDate)=%%</strong>
+                        </div>
+
+                        %%[ IF @bounceCount > 0 THEN ]%%
+                        <!-- PRETTY BOUNCE ALERT -->
+                        <div class="bounce-alert">
+                            <div class="ba-header">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+                                Last Bounce Info
+                            </div>
+                            <div class="ba-detail">
+                                %%=v(@bounceType)=%% <span style="opacity:0.7; font-weight:400; margin-left:6px;">(%%=v(@bounceDate)=%%)</span>
+                            </div>
+                            <div class="ba-grid">
+                                <div class="ba-row">
+                                    <span class="ba-label">Job ID</span>
+                                    <span class="ba-pill">%%=v(@bounceJobID)=%%</span>
+                                </div>
+                                <div class="ba-row">
+                                    <span class="ba-label">Email Name</span>
+                                    <span class="ba-val">%%=v(@bounceEmailName)=%%</span>
+                                </div>
+                            </div>
+                        </div>
+                        %%[ ENDIF ]%%
+
+                        %%[ IF @unsubCount > 0 THEN ]%%
+                        <div style="background:#F1F3F4; color:#5F6368; padding:12px; border-radius:8px; font-size:13px;">
+                            <strong>Unsubscribe Info</strong><br>
+                            %%=v(@unsubReason)=%% <br>
+                            <span style="opacity:0.8">%%=v(@unsubDate)=%%</span>
+                        </div>
+                        %%[ ENDIF ]%%
+                    </div>
+                </div>
+
+                <!-- RIGHT TIMELINE -->
+                <div class="timeline-card">
+                    <div class="tl-header-row">
+                        <div class="tl-title">Recent Activity</div>
+                    </div>
+                    <div class="tl-body">
+                        %%[ IF EMPTY(@timelineHtml) THEN ]%%
+                            <div style="padding:40px; text-align:center; color:var(--gm-subtext);">No recent activity found.</div>
+                        %%[ ELSE ]%%
+                            %%=v(@timelineHtml)=%%
+                        %%[ ENDIF ]%%
+                    </div>
+                </div>
+            </div>
+
+        %%[ ENDIF ]%%
+
+    </div>
+
+%%[ ENDIF ]%%
+
+<!-- MODAL FOR JOB DETAILS -->
+%%[ IF @showJobModal == "true" THEN ]%%
+<div class="modal-overlay">
+    <div class="modal-card">
+        <div class="modal-header">
+            <div class="modal-title-group">
+                <div class="modal-title">Job Analytics</div>
+                <div class="modal-sub">ID: %%=v(@viewJobId)=%%</div>
+            </div>
+        </div>
+        <div class="modal-body">
+            
+            <!-- SUBJECT CARD -->
+            <div class="job-card jc-full jc-blue">
+                <svg class="jc-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+                <div class="jc-label">Subject Line</div>
+                <div class="jc-val">%%=v(@modalSubject)=%%</div>
+            </div>
+
+            <!-- EMAIL NAME CARD -->
+            <div class="job-card jc-green">
+                <svg class="jc-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                <div class="jc-label">Email Name</div>
+                <div class="jc-val">%%=v(@modalJobName)=%%</div>
+            </div>
+
+            <!-- STATUS CARD -->
+            <div class="job-card jc-org">
+                <svg class="jc-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                <div class="jc-label">Job Status</div>
+                <div class="jc-val">%%=v(@modalJobStatus)=%%</div>
+            </div>
+
+            <!-- DEPLOY TIME -->
+            <div class="job-card jc-purp">
+                <svg class="jc-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                <div class="jc-label">Scheduled</div>
+                <div class="jc-val" style="font-size:14px;">%%=v(@modalSchedTime)=%%</div>
+            </div>
+
+            <!-- SEND TYPE & TRACKING -->
+            <div class="job-card jc-red">
+                <svg class="jc-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+                <div class="jc-label">Send Info</div>
+                <div class="jc-val" style="font-size:13px;">
+                    Type: <span style="font-weight:400">%%=v(@modalSendType)=%%</span><br>
+                    Tracking: <span style="font-weight:400">%%=v(@modalTrackStatus)=%%</span>
+                </div>
+            </div>
+
+            <!-- JOURNEY CONTEXT (FEATURED) -->
+            %%[ IF NOT EMPTY(@modalJourneyName) THEN ]%%
+            <div class="job-card jc-full jc-journey">
+                <svg class="jc-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c2.1-2.46 3-5.66 2.38-8a8 8 0 1 0-5.38 5z"/></svg>
+                <div class="jc-label" style="color:#6A1B9A;">Journey Context</div>
+                <div class="jc-val" style="font-size:18px; margin-bottom:12px;">%%=v(@modalJourneyName)=%%</div>
+                
+                <table class="journey-table">
+                    <tr>
+                        <td class="jt-label">Version</td>
+                        <td class="jt-val">v%%=v(@modalJourneyVer)=%%</td>
+                    </tr>
+                    <tr>
+                        <td class="jt-label">Status</td>
+                        <td class="jt-val">%%=v(@modalJourneyStatus)=%%</td>
+                    </tr>
+                    <tr>
+                        <td class="jt-label">Activity Name</td>
+                        <td class="jt-val">%%=v(@modalActivityName)=%%</td>
+                    </tr>
+                    <tr>
+                        <td class="jt-label">Published</td>
+                        <td class="jt-val">%%=v(@modalLastPublished)=%%</td>
+                    </tr>
+                </table>
+            </div>
+            %%[ ENDIF ]%%
+
+        </div>
+        <div class="modal-footer">
+            <a href="?search=%%=v(@searchInput)=%%&selectedKey=%%=v(@subKey)=%%" class="modal-close-btn">Close</a>
+        </div>
+    </div>
+</div>
+%%[ ENDIF ]%%
+
+</body>
+</html>
